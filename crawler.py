@@ -11,7 +11,7 @@ import furl
 import sqlalchemy
 import uvloop
 from sqlalchemy_utils import database_exists, create_database
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, SoupStrainer
 
 from links_table import links, URL_MAX_LENGTH
 from task import Task
@@ -24,7 +24,7 @@ CONFIG_JSON_PATH = "config.json"
 CRAWLER_DATABASE_NAME = "webcrawler"
 LINKS_TABLE_NAME = "links"
 URL_MASK_REGEX = re.compile(r".*wikipedia\.ru.*")
-CONSUMER_COUNT = 100
+CONSUMER_COUNT = 10
 
 
 def initialize_db(config):
@@ -59,6 +59,7 @@ async def task_consumer(consumer_index: int, task_queue: TaskQueue):
     logger.info("Consumer %s is in play!", consumer_index)
     while True:
         async with get_task(task_queue) as task:
+            logger.info("%s got %s", consumer_index, task.url)
             parsed_url = furl.furl(task.url)
             if task.url in task.visited:
                 continue
@@ -68,8 +69,13 @@ async def task_consumer(consumer_index: int, task_queue: TaskQueue):
             async with task.http_client.get(task.url) as resp:
                 if resp.status != http.HTTPStatus.OK:
                     continue
-                soup = BeautifulSoup(await resp.text(), "lxml")
+                try:
+                    html = await resp.text()
+                except Exception:
+                    continue
+                soup = BeautifulSoup(html, "lxml", parse_only=SoupStrainer('a'))
                 urls = set(a['href'] for a in soup.find_all('a', href=True))
+                new_urls = []
                 # logger.info("Got %s urls", len(urls))
                 for url in urls:
                     parsed = furl.furl(url).remove(
@@ -85,14 +91,16 @@ async def task_consumer(consumer_index: int, task_queue: TaskQueue):
                         new_url_to_crawl = str(parsed_url.copy().remove(path=True) / cleaned_url)
                         # logger.info("%s: Constructed new %s ...", consumer_index, new_url_to_crawl)
                     if (new_url_to_crawl and new_url_to_crawl not in task.visited and
-                            len(new_url_to_crawl) <= URL_MAX_LENGTH):
+                            len(new_url_to_crawl) < URL_MAX_LENGTH):
                         # logger.info("%s: Pushing %s ...", consumer_index, new_url_to_crawl)
-                        await task.conn.execute('''
-                                INSERT INTO links(url_from, url_to, "count") VALUES($1, $2, 1)
-                                ON CONFLICT DO NOTHING
-                            ''', task.url, new_url_to_crawl)
-                        await task_queue.add_task(task.clone_with_url(new_url_to_crawl))
-        # await asyncio.sleep(1)
+                        new_urls.append(new_url_to_crawl)
+                await asyncio.gather(*[task_queue.add_task(task.clone_with_url(url))
+                                       for url in new_urls])
+                async with task.connection_pool.acquire() as conn:
+                    await conn.executemany('''
+                        INSERT INTO links(url_from, url_to, "count") VALUES($1, $2, 1)
+                        ON CONFLICT DO NOTHING
+                    ''', [(task.url, url) for url in new_urls])
 
 
 async def main():
@@ -101,20 +109,21 @@ async def main():
         config = json.loads(raw_config)
         logger.info("Read config: %s", config)
     initialize_db(config)
-    conn = await asyncpg.connect(user="postgres", password="postgres",
-                                 database=CRAWLER_DATABASE_NAME,
-                                 host=config["postgres_host"],
-                                 port=config["postgres_port"])
+    pool = await asyncpg.create_pool(user="postgres", password="postgres",
+                                     database=CRAWLER_DATABASE_NAME,
+                                     host=config["postgres_host"],
+                                     port=config["postgres_port"],
+                                     min_size=30, max_size=100)
     url_mask = re.compile(config["url_mask_regex"])
     start_urls = config["start_urls"]
     visited = set()
     async with aiohttp.ClientSession() as client:
-        tasks = [Task(url, conn, url_mask, client, visited) for url in start_urls]
+        tasks = [Task(url, pool, url_mask, client, visited) for url in start_urls]
         task_queue = TaskQueue.create(tasks)
         consumers = [asyncio.create_task(task_consumer(i, task_queue))
                      for i in range(CONSUMER_COUNT)]
+        await asyncio.gather(*consumers)
         await task_queue.join()  # Implicitly awaits consumers, too
-        await asyncio.gather(consumers)
 
 def custom_exception_handler(loop, context):
     # first, handle with default handler
